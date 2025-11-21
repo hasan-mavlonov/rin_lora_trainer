@@ -6,12 +6,13 @@ channels:
 dependencies:
   - python=3.10
   - pytorch=2.3.1
+  - torchvision=0.18.1
   - pytorch-cuda=12.1
   - pip
   - pip:
       - accelerate>=0.24.1
       - compel
-      - datasets>=2.14
+      - datasets==2.14.6
       - pyarrow<14,>=12
       - diffusers>=0.31.0
       - huggingface-hub>=0.23.2
