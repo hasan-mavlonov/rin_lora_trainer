@@ -48,11 +48,12 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     StableDiffusionXLPipeline,
+    StableDiffusionXLRefinerPipeline,
     UNet2DConditionModel,
 )
 from diffusers.loaders import StableDiffusionLoraLoaderMixin
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import _set_state_dict_into_text_encoder, cast_training_params, compute_snr
+from diffusers.training_utils import cast_training_params, compute_snr
 from diffusers.utils import (
     check_min_version,
     convert_state_dict_to_diffusers,
@@ -128,12 +129,16 @@ def log_validation(
     accelerator,
     epoch,
     is_final_validation=False,
+    refiner=None,
 ):
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
         f" {args.validation_prompt}."
     )
     pipeline = pipeline.to(accelerator.device)
+    if refiner is not None:
+        refiner = refiner.to(accelerator.device)
+        refiner.set_progress_bar_config(disable=True)
     pipeline.set_progress_bar_config(disable=True)
 
     # run inference
@@ -145,7 +150,21 @@ def log_validation(
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     with autocast_ctx:
-        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+        images = []
+        for _ in range(args.num_validation_images):
+            if refiner is not None:
+                latent_output = pipeline(
+                    **pipeline_args, generator=generator, output_type="latent", denoising_end=args.refiner_start
+                )
+                refined = refiner(
+                    **pipeline_args,
+                    image=latent_output.images[0],
+                    generator=generator,
+                    denoising_start=args.refiner_start,
+                )
+                images.append(refined.images[0])
+            else:
+                images.append(pipeline(**pipeline_args, generator=generator).images[0])
 
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
@@ -191,6 +210,12 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_refiner_model_name_or_path",
+        type=str,
+        default=None,
+        help="Optional path to an SDXL refiner model to use for validation sampling.",
     )
     parser.add_argument(
         "--pretrained_vae_model_name_or_path",
@@ -253,6 +278,12 @@ def parse_args(input_args=None):
         help="A prompt that is used during validation to verify that the model is learning.",
     )
     parser.add_argument(
+        "--refiner_start",
+        type=float,
+        default=0.8,
+        help="Denoising start fraction to hand off to the SDXL refiner during validation sampling.",
+    )
+    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=4,
@@ -279,7 +310,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="sd-model-finetuned-lora",
+        default="/output",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -557,6 +588,12 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
+    if args.train_data_dir is None or not os.path.isdir(args.train_data_dir):
+        raise ValueError("--train_data_dir must point to a directory containing training images and captions.")
+    train_image_files = list(Path(args.train_data_dir).glob("**/*"))
+    if not any(p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} for p in train_image_files):
+        raise ValueError(f"No image files found under {args.train_data_dir}.")
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -780,11 +817,13 @@ def main(args):
                 )
 
         if args.train_text_encoder:
-            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_)
+            te_one_state = {k.replace("text_encoder.", ""): v for k, v in lora_state_dict.items() if k.startswith("text_encoder.")}
+            te_two_state = {k.replace("text_encoder_2.", ""): v for k, v in lora_state_dict.items() if k.startswith("text_encoder_2.")}
 
-            _set_state_dict_into_text_encoder(
-                lora_state_dict, prefix="text_encoder_2.", text_encoder=text_encoder_two_
-            )
+            if te_one_state:
+                set_peft_model_state_dict(text_encoder_one_, te_one_state, adapter_name="default")
+            if te_two_state:
+                set_peft_model_state_dict(text_encoder_two_, te_two_state, adapter_name="default")
 
         # Make sure the trainable params are in float32. This is again needed since the base models
         # are in `weight_dtype`. More details:
@@ -913,6 +952,13 @@ def main(args):
         tokens_two = tokenize_prompt(tokenizer_two, captions)
         return tokens_one, tokens_two
 
+    def _cache_tokens(examples):
+        tokens_one, tokens_two = tokenize_captions(examples)
+        return {"tokens_one": tokens_one.numpy(), "tokens_two": tokens_two.numpy()}
+
+    with accelerator.main_process_first():
+        dataset = dataset.map(_cache_tokens, batched=True, num_proc=args.preprocessing_num_workers)
+
     # Preprocessing the datasets.
     train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
     train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
@@ -951,7 +997,8 @@ def main(args):
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
         examples["pixel_values"] = all_images
-        tokens_one, tokens_two = tokenize_captions(examples)
+        tokens_one = torch.tensor(examples["tokens_one"])
+        tokens_two = torch.tensor(examples["tokens_two"])
         examples["input_ids_one"] = tokens_one
         examples["input_ids_two"] = tokens_two
         if args.debug_loss:
@@ -1246,10 +1293,21 @@ def main(args):
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
+                refiner = None
+                if args.pretrained_refiner_model_name_or_path is not None:
+                    refiner = StableDiffusionXLRefinerPipeline.from_pretrained(
+                        args.pretrained_refiner_model_name_or_path,
+                        text_encoder=unwrap_model(text_encoder_one),
+                        text_encoder_2=unwrap_model(text_encoder_two),
+                        revision=args.revision,
+                        variant=args.variant,
+                        torch_dtype=weight_dtype,
+                    )
 
-                images = log_validation(pipeline, args, accelerator, epoch)
+                images = log_validation(pipeline, args, accelerator, epoch, refiner=refiner)
 
                 del pipeline
+                del refiner
                 torch.cuda.empty_cache()
 
     # Save the lora layers
@@ -1295,12 +1353,25 @@ def main(args):
             torch_dtype=weight_dtype,
         )
 
+        refiner = None
+        if args.pretrained_refiner_model_name_or_path is not None:
+            refiner = StableDiffusionXLRefinerPipeline.from_pretrained(
+                args.pretrained_refiner_model_name_or_path,
+                text_encoder=pipeline.text_encoder,
+                text_encoder_2=pipeline.text_encoder_2,
+                revision=args.revision,
+                variant=args.variant,
+                torch_dtype=weight_dtype,
+            )
+
         # load attention processors
         pipeline.load_lora_weights(args.output_dir)
+        if refiner is not None:
+            refiner.load_lora_weights(args.output_dir)
 
         # run inference
         if args.validation_prompt and args.num_validation_images > 0:
-            images = log_validation(pipeline, args, accelerator, epoch, is_final_validation=True)
+            images = log_validation(pipeline, args, accelerator, epoch, is_final_validation=True, refiner=refiner)
 
         if args.push_to_hub:
             save_model_card(
