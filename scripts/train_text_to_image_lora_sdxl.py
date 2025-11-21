@@ -44,13 +44,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
 import diffusers
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    StableDiffusionXLPipeline,
-    StableDiffusionXLRefinerPipeline,
-    UNet2DConditionModel,
-)
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline, UNet2DConditionModel
 from diffusers.loaders import StableDiffusionLoraLoaderMixin
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import cast_training_params, compute_snr
@@ -63,6 +57,11 @@ from diffusers.utils import (
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_torch_npu_available, is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+
+try:
+    from diffusers import StableDiffusionXLRefinerPipeline
+except ImportError:
+    StableDiffusionXLRefinerPipeline = None
 
 
 if is_wandb_available():
@@ -180,6 +179,13 @@ def log_validation(
                 }
             )
     return images
+
+
+def require_refiner_pipeline():
+    if StableDiffusionXLRefinerPipeline is None:
+        raise ImportError(
+            "StableDiffusionXLRefinerPipeline is unavailable. Install diffusers>=0.32.0 to enable SDXL refiner support."
+        )
 
 
 def import_model_class_from_model_name_or_path(
@@ -1295,6 +1301,7 @@ def main(args):
                 )
                 refiner = None
                 if args.pretrained_refiner_model_name_or_path is not None:
+                    require_refiner_pipeline()
                     refiner = StableDiffusionXLRefinerPipeline.from_pretrained(
                         args.pretrained_refiner_model_name_or_path,
                         text_encoder=unwrap_model(text_encoder_one),
@@ -1355,6 +1362,7 @@ def main(args):
 
         refiner = None
         if args.pretrained_refiner_model_name_or_path is not None:
+            require_refiner_pipeline()
             refiner = StableDiffusionXLRefinerPipeline.from_pretrained(
                 args.pretrained_refiner_model_name_or_path,
                 text_encoder=pipeline.text_encoder,
