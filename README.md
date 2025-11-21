@@ -13,6 +13,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+`datasets` 2.14 relies on the legacy `pyarrow.PyExtensionType` API, so `pyarrow` is pinned below 14.0 in the dependency lists. Make
+sure you reinstall after pulling the latest `requirements.txt` or `environment.yaml` to avoid import errors during training.
+
 Conda users can create an environment with CUDA 12.x builds of PyTorch:
 
 ```bash

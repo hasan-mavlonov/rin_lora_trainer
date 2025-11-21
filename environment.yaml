@@ -12,6 +12,7 @@ dependencies:
       - accelerate>=0.24.1
       - compel
       - datasets>=2.14
+      - pyarrow<14,>=12
       - diffusers>=0.31.0
       - huggingface-hub>=0.23.2
       - peft==0.7.1
